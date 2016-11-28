@@ -16,9 +16,6 @@
 #include "includes/headers.p4"
 #include "includes/parser.p4"
 
-// heavy hitter threshold after which action is triggered
-#define HEAVY_HITTER_THRESHOLD 100
-
 field_list ipv4_checksum_list {
         ipv4.version;
         ipv4.ihl;
@@ -53,11 +50,6 @@ action _drop() {
 header_type custom_metadata_t {
     fields {
         nhop_ipv4: 32;
-        // additional fields for the hash values and the counter values
-        index_1: 32;
-        index_2: 32;
-        counter_1: 32;
-        counter_2: 32;
     }
 }
 
@@ -73,71 +65,25 @@ action set_dmac(dmac) {
     modify_field(ethernet.dstAddr, dmac);
 }
 
-// field list for the bloom filter hashes
-field_list heavy_hitter_list {
-        ipv4.srcAddr;
-        ipv4.dstAddr;
-        tcp.srcPort;
-        tcp.dstPort;
-        ipv4.protocol;
-}
-
-// hash functions for counting
-field_list_calculation heavy_hitter_hash_1 {
-    input {
-        heavy_hitter_list;
-    }
-    algorithm: csum16;
-    output_width: 16;
-}
-
-field_list_calculation heavy_hitter_hash_2 {
-    input {
-        heavy_hitter_list;
-    }
-    algorithm: crc16;
-    output_width: 16;
-}
-
-// Define the registers to store the counts
-register heavy_hitter_bf {
-    width: 32;
+counter ip_src_counter {
+    type: packets;
+    static: count_table;
     instance_count: 1024;
 }
 
-// Actions to set heavy hitter filter
-action update_hash() {
-    // compute the indexes of the counters
-    modify_field_with_hash_based_offset(custom_metadata.index_1, 0, heavy_hitter_hash_1, 1024);
-    modify_field_with_hash_based_offset(custom_metadata.index_2, 0, heavy_hitter_hash_2, 1024);
-
-    // read current counter values
-    register_read(custom_metadata.counter_1, heavy_hitter_bf, custom_metadata.index_1);
-    register_read(custom_metadata.counter_2, heavy_hitter_bf, custom_metadata.index_2);
-
-    // update the counters
-    add_to_field(custom_metadata.counter_1, 1);
-    add_to_field(custom_metadata.counter_2, 1);
-
-    // write back to the register
-    register_write(heavy_hitter_bf, custom_metadata.index_1, custom_metadata.counter_1);
-    register_write(heavy_hitter_bf, custom_metadata.index_2, custom_metadata.counter_2);
+action count_action(idx) {
+    count(ip_src_counter, idx);
 }
 
-// Define the tables to run actions
-table heavy_hitter_update {
-    actions {
-        update_hash;
+table count_table {
+    reads {
+        ipv4.srcAddr : lpm;
     }
-    size: 1024;
-}
-
-// Define table to drop the heavy hitter traffic
-table heavy_hitter_filter {
     actions {
+        count_action;
         _drop;
     }
-    size: 1024;
+    size : 1024;
 }
 
 table ipv4_lpm {
@@ -178,13 +124,9 @@ table send_frame {
 }
 
 control ingress {
-    apply(heavy_hitter_update);
-    if (custom_metadata.counter_1 > HEAVY_HITTER_THRESHOLD and custom_metadata.counter_2 > HEAVY_HITTER_THRESHOLD) {
-        apply(heavy_hitter_filter);
-    } else {
-        apply(ipv4_lpm);
-        apply(forward);
-    }
+    apply(count_table);
+    apply(ipv4_lpm);
+    apply(forward);
 }
 
 control egress {
